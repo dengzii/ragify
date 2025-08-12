@@ -1,0 +1,8 @@
+name: ragify_ffi
+description: A Dart ffi binding for ragify.
+output: 'ragify_ffi.dart'
+headers:
+  entry-points:
+    - '../../src/c_api.h'
+llvm-path:
+  - 'D:\LLVM'
