@@ -1,18 +1,26 @@
 #include "ragify.h"
 
 #include <cmath>
+#include <cstdarg>
 #include <iostream>
 #include "llama-context.h"
 #include "llama-model.h"
-#include "llama-vocab.h"
 #include "common.h"
 
 static void LOGE(const char *fmt, ...) {
-    std::cerr << "ERROR: " << fmt << std::endl;
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    printf("\n");
 }
 
 static void LOGI(const char *fmt, ...) {
-    std::cout << "INFO: " << fmt << std::endl;
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    printf("\n");
 }
 
 
@@ -22,31 +30,8 @@ struct result {
     std::vector<float> embedding;
 };
 
-static auto batch_add(llama_batch &batch,
-                      const llama_token id,
-                      const llama_pos pos,
-                      const std::vector<llama_seq_id> &seq_ids,
-                      const bool logits) -> void {
-    if (seq_ids.size() > 8) {
-        // LLAMA_MAX_SEQS is typically 8
-        LOGE("too many sequence IDs: %zu", seq_ids.size());
-        return;
-    }
-
-    batch.token[batch.n_tokens] = id;
-    batch.pos[batch.n_tokens] = pos;
-    batch.n_seq_id[batch.n_tokens] = seq_ids.size();
-    for (size_t i = 0; i < seq_ids.size(); ++i) {
-        batch.seq_id[batch.n_tokens][i] = seq_ids[i];
-    }
-    batch.logits[batch.n_tokens] = logits;
-
-    batch.n_tokens++;
-}
-
-
 ragify::ragify(): model(nullptr), ctx(nullptr),
-                                  model_rerank(nullptr), ctx_rerank(nullptr) {
+                  model_rerank(nullptr), ctx_rerank(nullptr) {
 }
 
 
@@ -67,7 +52,7 @@ int ragify::load_model(const std::string &model_path) {
 
     ctx = llama_init_from_model(model, ctx_params);
     LOGI("embedding model loaded: %s, pooling_type: %d, dim: %d", model->name.c_str(), ctx->pooling_type(),
-                     llama_model_n_embd(model));
+         llama_model_n_embd(model));
     if (!ctx) {
         release();
         return 2;
@@ -86,7 +71,8 @@ int ragify::load_rerank_model(const std::string &model_path) {
     }
 
     llama_context_params params = llama_context_default_params();
-    params.pooling_type = LLAMA_POOLING_TYPE_RANK;
+    params.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+    params.embeddings = true;
     // params.n_batch = 1024;
     // params.n_ctx = 2048;
 
@@ -122,88 +108,8 @@ void ragify::release() {
     model_rerank = nullptr;
 }
 
-
-std::vector<llama_token> ragify::tokenize(const llama_model *model,
-                                              const std::string &text,
-                                              const bool add_special,
-                                              const bool parse_special,
-                                              const bool add_eos) {
-    const auto *vocab = llama_model_get_vocab(model);
-    if (!vocab) {
-        LOGE("vocab is null");
-        return {};
-    }
-
-    std::vector<llama_token> tokens = vocab->tokenize(text, add_special, parse_special);
-
-    if (add_eos) {
-        if (llama_vocab_eos(vocab) >= 0 && (tokens.empty() || tokens.back() != llama_vocab_eos(vocab))) {
-            tokens.push_back(llama_vocab_eos(vocab));
-        }
-    }
-
-    return tokens;
-}
-
-void ragify::embd_normalize(const float *inp, float *out, const int n, const int normalization) {
-    if (!inp || !out || n <= 0) {
-        LOGE("invalid parameters in embd_normalize");
-        return;
-    }
-
-    double sum = 0.0;
-    switch (normalization) {
-        case -1: // no normalisation
-            sum = 1.0;
-            break;
-        case 0: // max absolute
-            for (int i = 0; i < n; i++) {
-                if (sum < std::abs(inp[i])) {
-                    sum = std::abs(inp[i]);
-                }
-            }
-            if (sum > 0.0) {
-                sum /= 32760.0; // make an int16 range
-            }
-            break;
-        case 2: // euclidean
-            for (int i = 0; i < n; i++) {
-                sum += inp[i] * inp[i];
-            }
-            sum = std::sqrt(sum);
-            break;
-        default: // p-norm (euclidean is p-norm p=2)
-            for (int i = 0; i < n; i++) {
-                sum += std::pow(std::abs(inp[i]), normalization);
-            }
-            sum = std::pow(sum, 1.0 / normalization);
-            break;
-    }
-    const float norm = sum > 0.0 ? static_cast<float>(1.0 / sum) : 0.0f;
-    for (int i = 0; i < n; i++) {
-        out[i] = inp[i] * norm;
-    }
-}
-
-auto ragify::batch_add_seq(llama_batch &batch, const std::vector<int32_t> &tokens,
-                                   const llama_seq_id seq_id) -> int {
-    const size_t n_tokens = tokens.size();
-    if (n_tokens == 0) {
-        return 0;
-    }
-
-    for (size_t i = 0; i < n_tokens; i++) {
-        batch_add(batch, tokens[i], i, {seq_id}, true);
-    }
-    return 0;
-}
-
 int ragify::batch_decode(llama_context *ctx, const llama_batch &batch, float *output, const int n_embd,
-                                 const int normalization) {
-    if (!ctx) {
-        LOGE("context is null");
-        return -1;
-    }
+                         const int normalization) {
     if (!output) {
         LOGE("output is null");
         return -1;
@@ -226,7 +132,7 @@ int ragify::batch_decode(llama_context *ctx, const llama_batch &batch, float *ou
             }
         }
         float *out = output + batch.seq_id[i][0] * n_embd;
-        embd_normalize(embd, out, n_embd, normalization);
+        common_embd_normalize(embd, out, n_embd, normalization);
     }
     llama_memory_clear(llama_get_memory(ctx), true);
     return 0;
@@ -248,7 +154,7 @@ std::vector<std::vector<float> > ragify::get_embeddings(const std::vector<std::s
     const auto n_batch = static_cast<int>(llama_n_batch(ctx));
 
     for (auto &input: inputs) {
-        auto tokens = tokenize(model, input, true, false, true);
+        auto tokens = common_tokenize(ctx, input, true, false);
         if (n_batch < static_cast<int>(tokens.size())) {
             LOGE("input size exceeds max batch size");
             return {};
@@ -283,8 +189,15 @@ std::vector<std::vector<float> > ragify::get_embeddings(const std::vector<std::s
             p += s;
             s = 0;
         }
-        // add to batch
-        batch_add_seq(batch, inp, s);
+        const size_t n_tokens = inp.size();
+        for (size_t i = 0; i < n_tokens; i++) {
+            batch.token[batch.n_tokens] = inp[i];
+            batch.pos[batch.n_tokens] = static_cast<int>(i);
+            batch.n_seq_id[batch.n_tokens] = 1;
+            batch.seq_id[batch.n_tokens][0] = s;
+            batch.logits[batch.n_tokens] = true;
+            batch.n_tokens++;
+        }
         s += 1;
     }
 
@@ -357,10 +270,11 @@ float ragify::rank_document(const std::string &query, const std::string &documen
 
     tokens.reserve(n_batch);
 
-    auto maxSize = static_cast<int>(n_batch / 2) - 2;
+    const auto maxSize = static_cast<int>(n_batch / 2) - 2;
 
     tokens.push_back(tokenBos);
-    auto part1 = tokenize(model_rerank, query, false, true, false);
+
+    auto part1 = common_tokenize(ctx_rerank, query, false);
     if (part1.size() > maxSize) {
         LOGE("token size exceeds limit");
         part1.resize(maxSize);
@@ -369,7 +283,7 @@ float ragify::rank_document(const std::string &query, const std::string &documen
     tokens.push_back(tokenEos);
     tokens.push_back(tokenSep);
 
-    auto part2 = tokenize(model_rerank, document, false, true, false);
+    auto part2 = common_tokenize(ctx_rerank, document, false);
     if (part2.size() > maxSize) {
         LOGE("token size exceeds limit");
         part2.resize(maxSize);
@@ -379,33 +293,33 @@ float ragify::rank_document(const std::string &query, const std::string &documen
 
     //////////////
 
-    const int n_ctx = ctx_rerank->n_ctx();
+    const uint32_t n_ctx = ctx_rerank->n_ctx();
     const int n_embd = llama_model_n_embd(model_rerank);
 
-    if (static_cast<int>(tokens.size()) > n_ctx) {
+    if (tokens.size() > n_ctx) {
         LOGE("input size exceeds max context");
         return 0.0f;
     }
 
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    llama_batch batch = llama_batch_init(static_cast<int32_t>(n_batch), 0, 1);
 
-    batch_add_seq(batch, tokens, 0);
+    for (llama_pos i = 0; i < tokens.size(); i++) {
+        common_batch_add(batch, tokens[i], i, {0}, true);
+    }
 
-    if (llama_encode(this->ctx_rerank, batch)) {
+    if (llama_encode(this->ctx_rerank, batch) < 0) {
         LOGE("llama_encode failed");
         llama_batch_free(batch);
         return 0.0f;
     }
-    LOGE("llama_encode success");
 
-    std::vector<float> embeddings(n_embd, 0.0f);
+    std::vector embeddings(n_embd, 0.0f);
 
     for (int i = 0; i < batch.n_tokens; ++i) {
         if (!batch.logits[i]) {
             continue;
         }
-        LOGE("get embeddings");
-        float *embd = llama_get_embeddings_seq(this->ctx_rerank, batch.seq_id[i][0]);
+        const float *embd = llama_get_embeddings_seq(this->ctx_rerank, batch.seq_id[i][0]);
         if (embd == nullptr) {
             embd = llama_get_embeddings_ith(this->ctx_rerank, i);
         }
@@ -413,14 +327,13 @@ float ragify::rank_document(const std::string &query, const std::string &documen
             LOGE("Failed to get embeddings");
             continue;
         }
-        embd_normalize(embd, embeddings.data(), n_embd, -1);
-        LOGE("normalize embeddings success");
+        common_embd_normalize(embd, embeddings.data(), n_embd, -1);
+        break;
     }
 
     llama_batch_free(batch);
 
-    LOGE("rerank success");
-    return embeddings[0];
+    return embeddings.at(0);
 }
 
 
